@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Runtime outputs
+logs/
+contrastive_data/
+outputs/results_*/
+outputs/checkpoints_*/
+outputs/*.csv
+outputs/*.txt
+outputs/*.png
+!outputs/.gitkeep
+
+# Local data (excluded from GitHub)
+data/
+Data Malwear/
+
+# OS / editor
+.DS_Store
+.vscode/

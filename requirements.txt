@@ -1,0 +1,13 @@
+# Core scientific stack
+numpy>=1.26
+pandas>=2.1
+scikit-learn>=1.4
+
+torch>=2.2
+
+# Visualization
+matplotlib>=3.8
+seaborn>=0.13
+
+# Optional: embedding visualization (UMAP)
+umap-learn>=0.5
