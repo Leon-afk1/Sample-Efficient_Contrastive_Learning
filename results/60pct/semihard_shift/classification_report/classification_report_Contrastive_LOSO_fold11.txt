@@ -1,0 +1,12 @@
+              precision    recall  f1-score   support
+
+    breakEgg       0.89      0.90      0.89       165
+         cut       0.72      0.95      0.82       161
+        flip       0.72      0.69      0.70       183
+        idle       0.80      0.99      0.88        81
+        pour       0.90      0.79      0.84       170
+        whip       0.96      0.71      0.82       172
+
+    accuracy                           0.82       932
+   macro avg       0.83      0.84      0.83       932
+weighted avg       0.83      0.82      0.82       932

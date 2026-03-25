@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=har_contrastive_all
+#SBATCH --job-name=har_random_allpct
 #SBATCH --time=24:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -7,14 +7,20 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
 #SBATCH --array=0-5
-#SBATCH --output=logs/contrastive_all_%A_%a.out
-#SBATCH --error=logs/contrastive_all_%A_%a.err
+#SBATCH --account=def-s1gabour
+#SBATCH --output=Log/slurm/random_%A_%a.out
+#SBATCH --error=Log/slurm/random_%A_%a.err
+#SBATCH --mail-user=leon.morales@utbm.fr
+#SBATCH --mail-type=END,FAIL
 
 set -euo pipefail
 
 FRACTIONS=("1.0" "0.7" "0.6" "0.5" "0.4" "0.3")
+PCT_LABELS=("100pct" "70pct" "60pct" "50pct" "40pct" "30pct")
 IDX="${SLURM_ARRAY_TASK_ID:-0}"
 FRACTION="${FRACTIONS[$IDX]}"
+PCT_LABEL="${PCT_LABELS[$IDX]}"
+METHOD="random"
 
 if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
   PACK_ROOT="$SLURM_SUBMIT_DIR"
@@ -49,37 +55,37 @@ fi
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export PYTHONUNBUFFERED=1
 
-RAW_DATA_DIR="${HAR_DATA_DIR:-$PACK_ROOT/data/raw}"
 CONTRASTIVE_DATA_DIR="${HAR_CONTRASTIVE_DATA_DIR:-$PACK_ROOT/contrastive_data}"
-RESULTS_BASE_DIR="${HAR_RESULTS_BASE_DIR:-$PACK_ROOT/outputs}"
-CHECKPOINTS_BASE_DIR="${HAR_CHECKPOINTS_BASE_DIR:-$PACK_ROOT/outputs}"
+RESULTS_DIR="$PACK_ROOT/results/${PCT_LABEL}/${METHOD}"
+CHECKPOINTS_DIR="$PACK_ROOT/checkpoints/${PCT_LABEL}/${METHOD}"
+TSNE_DIR="$PACK_ROOT/images/tsne/${PCT_LABEL}/${METHOD}"
+LOG_FILE="$PACK_ROOT/Log/${PCT_LABEL}/${METHOD}.log"
 PRETRAIN_EPOCHS="${HAR_PRETRAIN_EPOCHS:-50}"
 FINETUNE_EPOCHS="${HAR_FINETUNE_EPOCHS:-100}"
 PRETRAIN_PATIENCE="${HAR_PRETRAIN_PATIENCE:-10}"
 FINETUNE_PATIENCE="${HAR_FINETUNE_PATIENCE:-15}"
 
-mkdir -p "$PACK_ROOT/logs" "$PACK_ROOT/outputs" "$CONTRASTIVE_DATA_DIR"
+mkdir -p "$RESULTS_DIR/classification_report" "$CHECKPOINTS_DIR" "$TSNE_DIR" "$(dirname "$LOG_FILE")"
 
-echo "=========================================="
-echo "CONTRASTIVE TRAINING (SLURM ARRAY)"
-echo "=========================================="
-echo "Job ID: ${SLURM_JOB_ID:-N/A}"
-echo "Array Task ID: $IDX"
-echo "Fraction: $FRACTION"
-echo "Raw data dir: $RAW_DATA_DIR"
-echo "Contrastive data dir: $CONTRASTIVE_DATA_DIR"
-echo "Pretrain epochs/patience: $PRETRAIN_EPOCHS/$PRETRAIN_PATIENCE"
-echo "Finetune epochs/patience: $FINETUNE_EPOCHS/$FINETUNE_PATIENCE"
+echo "==========================================" | tee -a "$LOG_FILE"
+echo "RANDOM MINING — $PCT_LABEL" | tee -a "$LOG_FILE"
+echo "==========================================" | tee -a "$LOG_FILE"
+echo "Job ID:     ${SLURM_JOB_ID:-N/A}" | tee -a "$LOG_FILE"
+echo "Array Task: $IDX  |  Fraction: $FRACTION" | tee -a "$LOG_FILE"
+echo "Results:    $RESULTS_DIR" | tee -a "$LOG_FILE"
+echo "t-SNE:      $TSNE_DIR" | tee -a "$LOG_FILE"
 
 if [[ ! -f "$CONTRASTIVE_DATA_DIR/preprocessed_data.pkl" ]]; then
-  echo "Preprocessed data not found -> running preprocessing..."
+  echo "Preprocessing data..." | tee -a "$LOG_FILE"
   python "$PACK_ROOT/src/prepare_contrastive_dataset.py" \
-    --data-dir "$RAW_DATA_DIR" \
-    --output-dir "$CONTRASTIVE_DATA_DIR"
+    --data-dir "${HAR_DATA_DIR:-$PACK_ROOT/Data Malwear/brut}" \
+    --output-dir "$CONTRASTIVE_DATA_DIR" 2>&1 | tee -a "$LOG_FILE"
 fi
 
 python "$PACK_ROOT/src/train_contrastive_model.py" \
   --loss-type triplet \
+  --mining-strategy random \
+  --shift-prob 0.0 \
   --data-fraction "$FRACTION" \
   --strategies all \
   --pretrain-epochs "$PRETRAIN_EPOCHS" \
@@ -87,7 +93,9 @@ python "$PACK_ROOT/src/train_contrastive_model.py" \
   --pretrain-patience "$PRETRAIN_PATIENCE" \
   --finetune-patience "$FINETUNE_PATIENCE" \
   --data-dir "$CONTRASTIVE_DATA_DIR" \
-  --results-base-dir "$RESULTS_BASE_DIR" \
-  --checkpoints-base-dir "$CHECKPOINTS_BASE_DIR"
+  --results-dir "$RESULTS_DIR" \
+  --checkpoints-dir "$CHECKPOINTS_DIR" \
+  --tsne-dir "$TSNE_DIR" \
+  --method-name "$METHOD" 2>&1 | tee -a "$LOG_FILE"
 
-echo "Contrastive SLURM array task completed (fraction=$FRACTION)."
+echo "Done: $METHOD $PCT_LABEL" | tee -a "$LOG_FILE"

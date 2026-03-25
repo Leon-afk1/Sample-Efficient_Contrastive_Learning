@@ -12,8 +12,6 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from collections import Counter
-from itertools import combinations
-
 # PyTorch
 import torch
 import torch.nn as nn
@@ -34,6 +32,18 @@ import seaborn as sns
 # Configuration
 import warnings
 warnings.filterwarnings('ignore')
+
+# Reproducibility
+import random
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 # ============================================================================
 # DATA LOADING AND PREPARATION
@@ -679,8 +689,9 @@ def plot_confusion_matrix(y_true, y_pred, class_names, model_name, save_path):
 
 def run_stratified_split(X, y, num_classes, label_encoder, device, config):
     """Runs a standard stratified split (70/10/20)."""
+    data_fraction = config.get('data_fraction', 1.0)
     print("\n" + "="*80)
-    print("STRATEGY 1: STRATIFIED SPLIT")
+    print(f"STRATEGY 1: STRATIFIED SPLIT - {data_fraction*100:.0f}% of data")
     print("="*80)
     
     X_train_val, X_test, y_train_val, y_test = train_test_split(
@@ -691,6 +702,12 @@ def run_stratified_split(X, y, num_classes, label_encoder, device, config):
         X_train_val, y_train_val, test_size=0.125, random_state=42, 
         stratify=y_train_val
     )
+
+    if data_fraction < 1.0:
+        X_train, _, y_train, _ = train_test_split(
+            X_train, y_train, train_size=data_fraction, stratify=y_train, random_state=SEED
+        )
+        print(f"Training data reduced to {len(X_train)} samples ({data_fraction*100:.0f}%)")
     
     print(f"Train: {len(X_train)} ({len(X_train)/len(X):.1%})")
     print(f"Val:   {len(X_val)} ({len(X_val)/len(X):.1%})")
@@ -703,11 +720,13 @@ def run_stratified_split(X, y, num_classes, label_encoder, device, config):
 
     results = []
 
-    models_to_train = [
+    all_models = [
         ('DNN', DNN),
         ('LSTM', LSTMNet),
-        ('Transformer', TransformerNet)
+        ('Transformer', TransformerNet),
+        ('SDCNet', SDCNet)
     ]
+    models_to_train = [m for m in all_models if not config.get('sdcnet_only') or m[0] == 'SDCNet']
 
     for model_name, model_class in models_to_train:
         print(f"\n--- Training {model_name} ---")
@@ -747,7 +766,9 @@ def run_stratified_split(X, y, num_classes, label_encoder, device, config):
         
         report = classification_report(test_labels, test_preds, 
                                       target_names=label_encoder.classes_)
-        with open(os.path.join(config['results_dir'], 
+        report_dir = os.path.join(config['results_dir'], 'classification_report')
+        os.makedirs(report_dir, exist_ok=True)
+        with open(os.path.join(report_dir,
                               f"classification_report_{model_name}_Stratified.txt"), 'w') as f:
             f.write(report)
         
@@ -765,8 +786,9 @@ def run_stratified_split(X, y, num_classes, label_encoder, device, config):
 
 def run_loso_cross_validation(X, y, groups, num_classes, label_encoder, device, config):
     """Runs a full Leave-One-Subject-Out cross-validation."""
+    data_fraction = config.get('data_fraction', 1.0)
     print("\n" + "="*80)
-    print("STRATEGY 2: LOSO (LEAVE-ONE-SUBJECT-OUT) CROSS-VALIDATION")
+    print(f"STRATEGY 2: LOSO (LEAVE-ONE-SUBJECT-OUT) CROSS-VALIDATION - {data_fraction*100:.0f}% of data")
     print("="*80)
 
     unique_participants = np.unique(groups)
@@ -795,6 +817,11 @@ def run_loso_cross_validation(X, y, groups, num_classes, label_encoder, device, 
         y_val = y[mask_val]
         X_test = X[mask_test]
         y_test = y[mask_test]
+
+        if data_fraction < 1.0:
+            X_train, _, y_train, _ = train_test_split(
+                X_train, y_train, train_size=data_fraction, stratify=y_train, random_state=SEED + fold_idx
+            )
         
         print(f"Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
 
@@ -803,11 +830,13 @@ def run_loso_cross_validation(X, y, groups, num_classes, label_encoder, device, 
             batch_size=config['batch_size']
         )
 
-        models_to_train = [
+        all_models = [
             ('DNN', DNN),
             ('LSTM', LSTMNet),
-            ('Transformer', TransformerNet)
+            ('Transformer', TransformerNet),
+            ('SDCNet', SDCNet)
         ]
+        models_to_train = [m for m in all_models if not config.get('sdcnet_only') or m[0] == 'SDCNet']
 
         for model_name, model_class in models_to_train:
             print(f"\n  Training {model_name} (Fold {fold_idx+1})...")
@@ -848,7 +877,9 @@ def run_loso_cross_validation(X, y, groups, num_classes, label_encoder, device, 
             
             report = classification_report(test_labels, test_preds, 
                                           target_names=label_encoder.classes_)
-            with open(os.path.join(config['results_dir'], 
+            report_dir = os.path.join(config['results_dir'], 'classification_report')
+            os.makedirs(report_dir, exist_ok=True)
+            with open(os.path.join(report_dir,
                                   f"classification_report_{model_name}_LOSO_fold{fold_idx+1}.txt"), 'w') as f:
                 f.write(report)
             
@@ -885,58 +916,64 @@ def run_loso_cross_validation(X, y, groups, num_classes, label_encoder, device, 
 
 def run_logo_cross_validation(X, y, groups, num_classes, label_encoder, device, config):
     """Runs a Leave-One-Group-Out cross-validation with groups of 3 test participants."""
+    data_fraction = config.get('data_fraction', 1.0)
+    n_folds = 5
     print("\n" + "="*80)
-    print("STRATEGY 3: LOGO (LEAVE-ONE-GROUP-OUT) CROSS-VALIDATION")
+    print(f"STRATEGY 3: LOGO (LEAVE-ONE-GROUP-OUT) {n_folds}-FOLD CV - {data_fraction*100:.0f}% of data")
     print("="*80)
-    
-    unique_participants = np.unique(groups)
+
+    unique_participants = sorted(np.unique(groups))
     n_participants = len(unique_participants)
-    
-    # Groupes de 3 participants pour test
-    n_test_participants = 3
-    n_val_participants = 2
-    
-    if n_participants < (n_test_participants + n_val_participants):
+
+    if n_participants < 5:
         print(f"WARNING: Not enough participants ({n_participants}) for LOGO")
-        print(f"Need at least {n_test_participants + n_val_participants} participants")
         return []
-    
-    # Generate all possible combinations of test participants
-    test_combinations = list(combinations(unique_participants, n_test_participants))
-    n_folds = min(len(test_combinations), 5)
+
+    # Same non-overlapping seed-42 permutation as train_contrastive_model.py
+    np.random.seed(SEED)
+    shuffled_participants = np.random.permutation(unique_participants)
 
     print(f"Participants: {n_participants}")
-    print(f"Possible combinations: {len(test_combinations)}")
     print(f"Running {n_folds} folds")
-    
+
     results = []
-    
+
     for fold_idx in range(n_folds):
-        test_participants = test_combinations[fold_idx]
-        
         print(f"\n--- FOLD {fold_idx+1}/{n_folds} ---")
+
+        start_test = (fold_idx * 3) % n_participants
+        test_participants = [shuffled_participants[(start_test + i) % n_participants]
+                             for i in range(3)]
+
+        start_val = (start_test + 3) % n_participants
+        val_participants = [shuffled_participants[(start_val + i) % n_participants]
+                            for i in range(2)]
+
+        train_participants = [p for p in unique_participants
+                              if p not in test_participants and p not in val_participants]
+
         print(f"Participants TEST: {test_participants}")
-        
-        # Select validation participants (next unused ones after test set)
-        remaining_participants = [p for p in unique_participants if p not in test_participants]
-        val_participants = tuple(remaining_participants[:n_val_participants])
-        
-        print(f"Participants VAL: {val_participants}")
-        
+        print(f"Participants VAL:  {val_participants}")
+
         # Create split masks
         mask_test = np.isin(groups, test_participants)
         mask_val = np.isin(groups, val_participants)
-        mask_train = ~(mask_test | mask_val)
-        
+        mask_train = np.isin(groups, train_participants)
+
         X_train = X[mask_train]
         y_train = y[mask_train]
         X_val = X[mask_val]
         y_val = y[mask_val]
         X_test = X[mask_test]
         y_test = y[mask_test]
-        
+
+        if data_fraction < 1.0:
+            X_train, _, y_train, _ = train_test_split(
+                X_train, y_train, train_size=data_fraction, stratify=y_train, random_state=SEED + fold_idx
+            )
+
         print(f"Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
-        
+
         if len(X_train) == 0 or len(X_val) == 0 or len(X_test) == 0:
             print("WARNING: One of the splits is empty, skipping fold")
             continue
@@ -946,11 +983,13 @@ def run_logo_cross_validation(X, y, groups, num_classes, label_encoder, device, 
             batch_size=config['batch_size']
         )
 
-        models_to_train = [
+        all_models = [
             ('DNN', DNN),
             ('LSTM', LSTMNet),
-            ('Transformer', TransformerNet)
+            ('Transformer', TransformerNet),
+            ('SDCNet', SDCNet)
         ]
+        models_to_train = [m for m in all_models if not config.get('sdcnet_only') or m[0] == 'SDCNet']
 
         for model_name, model_class in models_to_train:
             print(f"\n  Training {model_name} (Fold {fold_idx+1})...")
@@ -991,7 +1030,9 @@ def run_logo_cross_validation(X, y, groups, num_classes, label_encoder, device, 
             
             report = classification_report(test_labels, test_preds, 
                                           target_names=label_encoder.classes_)
-            with open(os.path.join(config['results_dir'], 
+            report_dir = os.path.join(config['results_dir'], 'classification_report')
+            os.makedirs(report_dir, exist_ok=True)
+            with open(os.path.join(report_dir,
                                   f"classification_report_{model_name}_LOGO_fold{fold_idx+1}.txt"), 'w') as f:
                 f.write(report)
             
@@ -1243,6 +1284,10 @@ def main():
                         help='Learning rate (default: 0.001)')
     parser.add_argument('--weight-decay', type=float, default=1e-4,
                         help='Weight decay (default: 1e-4)')
+    parser.add_argument('--data-fraction', type=float, default=1.0,
+                        help='Fraction of training data to use (default: 1.0 = 100%%)')
+    parser.add_argument('--sdcnet-only', action='store_true',
+                        help='Train only SDCNet (skip DNN, LSTM, Transformer)')
     args = parser.parse_args()
 
     print("="*80)
@@ -1256,7 +1301,9 @@ def main():
         'batch_size': args.batch_size,
         'num_epochs': args.num_epochs,
         'lr': args.lr,
-        'weight_decay': args.weight_decay
+        'weight_decay': args.weight_decay,
+        'data_fraction': args.data_fraction,
+        'sdcnet_only': args.sdcnet_only,
     }
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1318,8 +1365,9 @@ def main():
     all_results.extend(results_logo)
 
     df_all_results = pd.DataFrame(all_results)
-    df_all_results.to_csv(os.path.join(config['results_dir'], 'all_results_summary.csv'),
+    df_all_results.to_csv(os.path.join(config['results_dir'], 'all_results_baseline.csv'),
                           index=False)
+    print(f"\nAll results saved to: {os.path.join(config['results_dir'], 'all_results_baseline.csv')}")
 
     generate_comparative_summary(df_all_results, config['results_dir'])
 

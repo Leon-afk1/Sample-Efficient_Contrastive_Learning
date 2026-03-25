@@ -42,16 +42,22 @@ except ImportError:
     TSNE_AVAILABLE = False
     print("WARNING: t-SNE not available")
 
+import random
+
 # Configuration
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 SEED = 42
 DATA_FRACTION = 1.0  # Fraction of training data to use (1.0 = 100%)
 
-# Fixer les seeds
+# Fixer les seeds (reproductibilité complète)
+random.seed(SEED)
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 print("="*80)
 print("CONTRASTIVE LEARNING - MULTI-LOSS SUPPORT")
@@ -70,19 +76,22 @@ print("="*80)
 class TripletDataset(Dataset):
     """Dataset for Triplet Loss training."""
 
-    def __init__(self, X, y, triplet_indices, augment=False):
+    def __init__(self, X, y, triplet_indices, augment=False,
+                 shift_prob=0.0, shift_max_frac=0.1):
         self.X = torch.FloatTensor(X)
         self.y = torch.LongTensor(y)
         self.anchors = triplet_indices['anchors']
         self.positives = triplet_indices['positives']
         self.negatives = triplet_indices['negatives']
         self.augment = augment
+        self.shift_prob = shift_prob
+        self.shift_max_frac = shift_max_frac
     
     def __len__(self):
         return len(self.anchors)
     
     def augment_sample(self, x):
-        """Applies random augmentations (jitter and scaling)."""
+        """Applies random augmentations (jitter, scaling, and optional temporal shifting)."""
         if np.random.random() < 0.5:
             # Jitter
             noise = torch.randn_like(x) * 0.05
@@ -92,6 +101,13 @@ class TripletDataset(Dataset):
             # Scaling
             scale = np.random.uniform(0.8, 1.2)
             x = x * scale
+
+        if self.shift_prob > 0.0 and np.random.random() < self.shift_prob:
+            # Temporal shifting (circular shift along time axis)
+            seq_len = x.shape[0]
+            max_shift = max(1, int(seq_len * self.shift_max_frac))
+            shift = np.random.randint(-max_shift, max_shift + 1)
+            x = torch.roll(x, shifts=shift, dims=0)
 
         return x
 
@@ -115,16 +131,18 @@ class TripletDataset(Dataset):
 class PairDataset(Dataset):
     """Dataset for SimCLR and SupCon (anchor-positive pairs with augmentation)."""
     
-    def __init__(self, X, y, augment=True):
+    def __init__(self, X, y, augment=True, shift_prob=0.0, shift_max_frac=0.1):
         self.X = torch.FloatTensor(X)
         self.y = torch.LongTensor(y)
         self.augment = augment
+        self.shift_prob = shift_prob
+        self.shift_max_frac = shift_max_frac
     
     def __len__(self):
         return len(self.X)
     
     def augment_sample(self, x):
-        """Applies random augmentations (jitter and scaling)."""
+        """Applies random augmentations (jitter, scaling, and optional temporal shifting)."""
         if np.random.random() < 0.5:
             # Jitter
             noise = torch.randn_like(x) * 0.05
@@ -134,6 +152,13 @@ class PairDataset(Dataset):
             # Scaling
             scale = np.random.uniform(0.8, 1.2)
             x = x * scale
+
+        if self.shift_prob > 0.0 and np.random.random() < self.shift_prob:
+            # Temporal shifting (circular shift along time axis)
+            seq_len = x.shape[0]
+            max_shift = max(1, int(seq_len * self.shift_max_frac))
+            shift = np.random.randint(-max_shift, max_shift + 1)
+            x = torch.roll(x, shifts=shift, dims=0)
 
         return x
 
@@ -164,6 +189,49 @@ class StandardDataset(Dataset):
     
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
+
+
+class AugmentedDataset(Dataset):
+    """
+    Dataset returning a single augmented (sample, label) pair per index.
+    Used for online semi-hard triplet mining, where triplets are selected
+    dynamically from the batch embeddings rather than pre-generated.
+    """
+
+    def __init__(self, X, y, augment=True, shift_prob=0.0, shift_max_frac=0.1):
+        self.X = torch.FloatTensor(X)
+        self.y = torch.LongTensor(y)
+        self.augment = augment
+        self.shift_prob = shift_prob
+        self.shift_max_frac = shift_max_frac
+
+    def __len__(self):
+        return len(self.X)
+
+    def augment_sample(self, x):
+        """Applies random augmentations (jitter, scaling, optional temporal shift)."""
+        if np.random.random() < 0.5:
+            # Additive Gaussian jitter
+            x = x + torch.randn_like(x) * 0.05
+
+        if np.random.random() < 0.5:
+            # Random amplitude scaling
+            x = x * np.random.uniform(0.8, 1.2)
+
+        if self.shift_prob > 0.0 and np.random.random() < self.shift_prob:
+            # Circular temporal shift
+            seq_len = x.shape[0]
+            max_shift = max(1, int(seq_len * self.shift_max_frac))
+            shift = np.random.randint(-max_shift, max_shift + 1)
+            x = torch.roll(x, shifts=shift, dims=0)
+
+        return x
+
+    def __getitem__(self, idx):
+        x = self.X[idx].clone()
+        if self.augment:
+            x = self.augment_sample(x)
+        return x, self.y[idx]
 
 
 # ============================================================================
@@ -328,7 +396,83 @@ def generate_triplets_for_subset(y_subset, n_triplets):
 
 
 # ============================================================================
-# 4. TRAINING FUNCTIONS
+# 4. SEMI-HARD TRIPLET MINING
+# ============================================================================
+
+def mine_semihard_triplets(embeddings, labels, margin=1.0):
+    """
+    Online semi-hard triplet mining within a batch.
+
+    For each anchor-positive pair (i, j) with the same class:
+      - Candidate negatives are all samples with a different class.
+      - Semi-hard negatives satisfy: d(a,p) < d(a,n) < d(a,p) + margin
+        (further than the positive but still within the loss margin).
+      - If no semi-hard negative exists, falls back to the hardest negative
+        (the one with the smallest distance to the anchor).
+
+    Args:
+        embeddings: (N, D) float tensor of L2-normalised projections (detached).
+        labels:     (N,)  long tensor of class labels.
+        margin:     float, triplet margin (should match the loss function).
+
+    Returns:
+        Tuple (anchors, positives, negatives) of 1-D LongTensors holding
+        batch indices, or None if the batch contains no valid triplets.
+    """
+    n = embeddings.size(0)
+    device = embeddings.device
+
+    # Pairwise L2 distances — stable even for normalised vectors
+    diff = embeddings.unsqueeze(0) - embeddings.unsqueeze(1)  # (N, N, D)
+    dists = diff.pow(2).sum(2).clamp(min=0).sqrt()            # (N, N)
+
+    # Positive / negative masks
+    same_class = labels.unsqueeze(0) == labels.unsqueeze(1)   # (N, N) bool
+    eye = torch.eye(n, dtype=torch.bool, device=device)
+    is_pos = same_class & ~eye   # same class, different sample
+    is_neg = ~same_class         # different class
+
+    anchors_list, positives_list, negatives_list = [], [], []
+
+    for i in range(n):
+        pos_indices = is_pos[i].nonzero(as_tuple=False).view(-1)
+        neg_indices = is_neg[i].nonzero(as_tuple=False).view(-1)
+
+        if pos_indices.numel() == 0 or neg_indices.numel() == 0:
+            continue
+
+        for j in pos_indices:
+            d_ap = dists[i, j]
+            d_an = dists[i, neg_indices]  # distances to all negatives
+
+            # Semi-hard: d(a,p) < d(a,n) < d(a,p) + margin
+            semihard_mask = (d_an > d_ap) & (d_an < d_ap + margin)
+            candidates = neg_indices[semihard_mask]
+
+            if candidates.numel() > 0:
+                # Pick a random semi-hard negative
+                pick = torch.randint(candidates.numel(), (1,)).item()
+                neg = candidates[pick].item()
+            else:
+                # Fallback: hardest negative (smallest d(a,n))
+                neg = neg_indices[d_an.argmin()].item()
+
+            anchors_list.append(i)
+            positives_list.append(j.item())
+            negatives_list.append(neg)
+
+    if not anchors_list:
+        return None
+
+    return (
+        torch.tensor(anchors_list,   dtype=torch.long, device=device),
+        torch.tensor(positives_list, dtype=torch.long, device=device),
+        torch.tensor(negatives_list, dtype=torch.long, device=device),
+    )
+
+
+# ============================================================================
+# 5. TRAINING FUNCTIONS
 # ============================================================================
 
 def train_contrastive_epoch(model, dataloader, optimizer, criterion, device, loss_type='triplet'):
@@ -383,6 +527,60 @@ def train_contrastive_epoch(model, dataloader, optimizer, criterion, device, los
         total_loss += loss.item()
     
     return total_loss / len(dataloader)
+
+
+def train_contrastive_epoch_semihard(model, dataloader, optimizer, criterion, device, config):
+    """
+    Trains one contrastive epoch using online semi-hard triplet mining.
+
+    Pipeline per batch:
+      1. Forward pass — compute L2-normalised projections for all samples.
+      2. Mine semi-hard triplets from the (detached) projections.
+      3. Compute triplet loss on the mined (anchor, positive, negative) tuples.
+      4. Backprop through the same projection graph (no second forward pass).
+
+    Batches that yield no valid semi-hard triplets are silently skipped.
+    """
+    model.train()
+    total_loss = 0.0
+    n_batches_with_triplets = 0
+    margin = config.get('triplet_margin', 1.0)
+
+    for X_batch, y_batch in dataloader:
+        X_batch = X_batch.to(device)
+        y_batch = y_batch.to(device)
+
+        optimizer.zero_grad()
+
+        # Single forward pass — keep gradient graph
+        projections = model(X_batch)  # (B, D), L2-normalised
+
+        # Mine triplets from detached projections (no gradient needed for mining)
+        triplet_indices = mine_semihard_triplets(
+            projections.detach(), y_batch, margin=margin
+        )
+
+        if triplet_indices is None:
+            continue
+
+        a_idx, p_idx, n_idx = triplet_indices
+
+        if a_idx.numel() == 0:
+            continue
+
+        # Triplet loss reuses the same projection graph
+        loss = criterion(projections[a_idx], projections[p_idx], projections[n_idx])
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        n_batches_with_triplets += 1
+
+    # Guard against batches where no valid triplets existed
+    if n_batches_with_triplets == 0:
+        return 0.0
+
+    return total_loss / n_batches_with_triplets
 
 
 def train_classification_epoch(model, dataloader, optimizer, criterion, device):
@@ -506,9 +704,12 @@ def plot_embeddings(embeddings, labels, idx_to_label, method='umap', save_path=N
     plt.close()
 
 
-def visualize_embeddings(model, X_test, y_test, idx_to_label, results_dir, fold_name=""):
+def visualize_embeddings(model, X_test, y_test, idx_to_label, results_dir, fold_name="",
+                         tsne_dir=None, method_name=""):
     """
     Generates UMAP and t-SNE visualizations of the embedding space.
+    t-SNE images are saved to tsne_dir/{method_name}_{fold_name}.png when tsne_dir is set,
+    otherwise fall back to results_dir.
     """
     print("\n" + "="*80)
     print("EMBEDDING SPACE VISUALIZATION")
@@ -519,15 +720,21 @@ def visualize_embeddings(model, X_test, y_test, idx_to_label, results_dir, fold_
 
     embeddings, labels = extract_embeddings(model, test_loader, DEVICE)
     print(f"Embeddings extracted: {embeddings.shape}")
-    
-    # UMAP
+
+    # Determine t-SNE output directory
+    _tsne_dir = tsne_dir if tsne_dir else results_dir
+    os.makedirs(_tsne_dir, exist_ok=True)
+    prefix = f"{method_name}_" if method_name else ""
+
+    # UMAP (saved alongside results, not in tsne_dir)
     if UMAP_AVAILABLE:
         umap_path = os.path.join(results_dir, f'embedding_umap{fold_name}.png')
         plot_embeddings(embeddings, labels, idx_to_label, method='umap', save_path=umap_path)
-    
+
     # t-SNE
     if TSNE_AVAILABLE:
-        tsne_path = os.path.join(results_dir, f'embedding_tsne{fold_name}.png')
+        tsne_suffix = fold_name.lstrip('_') if fold_name else 'Stratified'
+        tsne_path = os.path.join(_tsne_dir, f'{prefix}{tsne_suffix}.png')
         plot_embeddings(embeddings, labels, idx_to_label, method='tsne', save_path=tsne_path)
 
 
@@ -538,39 +745,55 @@ def visualize_embeddings(model, X_test, y_test, idx_to_label, results_dir, fold_
 def pretrain_contrastive(X_train, y_train, triplet_indices, config, fold_name=""):
     """
     Phase 1: Contrastive pre-training.
-    Supports: Triplet, SimCLR, SupCon
+
+    Supports:
+      - loss_type: triplet | simclr | supcon
+      - mining_strategy: random (offline, pre-generated) | semihard (online, per-batch)
+
+    When mining_strategy == 'semihard', triplet_indices is ignored and triplets
+    are mined online from each batch using mine_semihard_triplets().
     """
     print("\n" + "="*80)
     print(f"PHASE 1: CONTRASTIVE PRE-TRAINING ({config['loss_type'].upper()}) {fold_name}")
     print("="*80)
-    
+
     loss_type = config['loss_type']
-    
-    # Dataset et DataLoader selon le type de loss
-    if loss_type == 'triplet':
-        # Triplet Loss: uses pre-generated triplets
-        dataset = TripletDataset(X_train, y_train, triplet_indices, augment=True)
+    mining_strategy = config.get('mining_strategy', 'random')
+    shift_prob = config.get('shift_prob', 0.0)
+    shift_max_frac = config.get('shift_max_frac', 0.1)
+
+    # Build the appropriate dataset depending on loss type and mining strategy
+    if loss_type == 'triplet' and mining_strategy == 'semihard':
+        # Online semi-hard mining: dataset yields (augmented_sample, label) pairs
+        dataset = AugmentedDataset(X_train, y_train, augment=True,
+                                   shift_prob=shift_prob, shift_max_frac=shift_max_frac)
+    elif loss_type == 'triplet':
+        # Random offline mining: dataset contains pre-generated (anchor, pos, neg) triplets
+        dataset = TripletDataset(X_train, y_train, triplet_indices, augment=True,
+                                 shift_prob=shift_prob, shift_max_frac=shift_max_frac)
     else:
-        # SimCLR/SupCon: uses on-the-fly augmented pairs
-        dataset = PairDataset(X_train, y_train, augment=True)
-    
-    dataloader = DataLoader(dataset, batch_size=config['batch_size'], 
-                           shuffle=True, num_workers=0)
-    
+        # SimCLR / SupCon: on-the-fly augmented pairs
+        dataset = PairDataset(X_train, y_train, augment=True,
+                              shift_prob=shift_prob, shift_max_frac=shift_max_frac)
+
+    dataloader = DataLoader(dataset, batch_size=config['batch_size'],
+                            shuffle=True, num_workers=0)
+
     print(f"\nSamples: {len(dataset)}")
     print(f"Batch size: {config['batch_size']}")
     print(f"Loss function: {loss_type}")
-    
+    print(f"Mining strategy: {mining_strategy}")
+
     # Model
     model = ContrastiveModel(
         input_channels=X_train.shape[2],
         projection_dim=config['projection_dim']
     ).to(DEVICE)
-    
+
     # Optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'], 
-                                weight_decay=config['weight_decay'])
-    
+    optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'],
+                                 weight_decay=config['weight_decay'])
+
     # Loss function
     if loss_type == 'triplet':
         criterion = get_contrastive_loss('triplet', margin=config['triplet_margin'], p=2)
@@ -585,18 +808,26 @@ def pretrain_contrastive(X_train, y_train, triplet_indices, config, fold_name=""
 
     print(f"\nPre-training ({config['pretrain_epochs']} epochs)...")
     start_time = time.time()
-    
+
     best_loss = float('inf')
     patience_counter = 0
-    
+
     for epoch in range(config['pretrain_epochs']):
-        epoch_loss = train_contrastive_epoch(model, dataloader, optimizer, 
-                                            criterion, DEVICE, loss_type=loss_type)
-        
+        if loss_type == 'triplet' and mining_strategy == 'semihard':
+            # Online semi-hard mining path
+            epoch_loss = train_contrastive_epoch_semihard(
+                model, dataloader, optimizer, criterion, DEVICE, config
+            )
+        else:
+            # Random offline mining or SimCLR/SupCon
+            epoch_loss = train_contrastive_epoch(
+                model, dataloader, optimizer, criterion, DEVICE, loss_type=loss_type
+            )
+
         if (epoch + 1) % 10 == 0:
             print(f"  Epoch [{epoch+1}/{config['pretrain_epochs']}] - Loss: {epoch_loss:.4f}")
-        
-        # Early stopping
+
+        # Early stopping on training loss
         if epoch_loss < best_loss:
             best_loss = epoch_loss
             patience_counter = 0
@@ -609,7 +840,7 @@ def pretrain_contrastive(X_train, y_train, triplet_indices, config, fold_name=""
     duration = time.time() - start_time
     print(f"\nPre-training completed in {duration:.2f}s")
     print(f"Best loss: {best_loss:.4f}")
-    
+
     return model
 
 
@@ -705,18 +936,23 @@ def finetune_classification(pretrained_model, X_train, y_train, X_val, y_val,
 
 def generate_reports(test_preds, test_labels, idx_to_label, results_dir,
                     strategy, fold_name=""):
-    """Generates classification reports and confusion matrices."""
-    # Classification report
-    report = classification_report(test_labels, test_preds, 
+    """Generates classification reports and confusion matrices.
+    Classification reports go to results_dir/classification_report/.
+    Confusion matrices remain in results_dir/.
+    """
+    # Classification reports in dedicated subfolder
+    report_dir = os.path.join(results_dir, 'classification_report')
+    os.makedirs(report_dir, exist_ok=True)
+
+    report = classification_report(test_labels, test_preds,
                                    target_names=[idx_to_label[i] for i in range(len(idx_to_label))],
                                    digits=2)
-    
-    report_path = os.path.join(results_dir, 
-                              f'classification_report_Contrastive_{strategy}{fold_name}.txt')
+    report_path = os.path.join(report_dir,
+                               f'classification_report_Contrastive_{strategy}{fold_name}.txt')
     with open(report_path, 'w') as f:
         f.write(report)
-    
-    # Confusion matrix
+
+    # Confusion matrix stays in results_dir
     cm = confusion_matrix(test_labels, test_preds)
     plt.figure(figsize=(10, 8))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
@@ -726,9 +962,9 @@ def generate_reports(test_preds, test_labels, idx_to_label, results_dir,
     plt.ylabel('True Label')
     plt.xlabel('Predicted Label')
     plt.tight_layout()
-    
-    cm_path = os.path.join(results_dir, 
-                          f'confusion_matrix_Contrastive_{strategy}{fold_name}.png')
+
+    cm_path = os.path.join(results_dir,
+                           f'confusion_matrix_Contrastive_{strategy}{fold_name}.png')
     plt.savefig(cm_path, dpi=150, bbox_inches='tight')
     plt.close()
 
@@ -770,10 +1006,14 @@ def run_stratified_split(X, y, participants, idx_to_label, config):
 
     print(f"Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
 
-    # Generate triplets for the training set
-    n_triplets = len(X_train) * 5
-    triplet_indices = generate_triplets_for_subset(y_train, n_triplets)
-    print(f"Triplets generated: {len(triplet_indices['anchors'])}")
+    # Pre-generate triplets only for random mining (semihard mines online per batch)
+    if config.get('mining_strategy', 'random') == 'semihard':
+        triplet_indices = None
+        print("Mining strategy: semi-hard (online, no pre-generation needed)")
+    else:
+        n_triplets = len(X_train) * 5
+        triplet_indices = generate_triplets_for_subset(y_train, n_triplets)
+        print(f"Triplets generated: {len(triplet_indices['anchors'])}")
 
     # Phase 1: Pre-training
     contrastive_model = pretrain_contrastive(X_train, y_train, triplet_indices, config)
@@ -788,7 +1028,9 @@ def run_stratified_split(X, y, participants, idx_to_label, config):
                     config['results_dir'], 'Stratified')
 
     visualize_embeddings(classifier, X_test, y_test, idx_to_label,
-                        config['results_dir'], fold_name="_Stratified")
+                        config['results_dir'], fold_name="_Stratified",
+                        tsne_dir=config.get('tsne_dir'),
+                        method_name=config.get('method_name', ''))
     
     result = {
         'Strategy': 'Stratified',
@@ -851,12 +1093,14 @@ def run_loso_cross_validation(X, y, participants, idx_to_label, config):
 
         print(f"Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
 
-        # Generate triplets
-        n_triplets = len(X_train) * 3
-        triplet_indices = generate_triplets_for_subset(y_train, n_triplets)
-
-        if triplet_indices is None:
-            continue
+        # Pre-generate triplets only for random mining
+        if config.get('mining_strategy', 'random') == 'semihard':
+            triplet_indices = None
+        else:
+            n_triplets = len(X_train) * 3
+            triplet_indices = generate_triplets_for_subset(y_train, n_triplets)
+            if triplet_indices is None:
+                continue
 
         # Phase 1: Pre-training
         contrastive_model = pretrain_contrastive(X_train, y_train, triplet_indices,
@@ -884,7 +1128,9 @@ def run_loso_cross_validation(X, y, participants, idx_to_label, config):
     # Visualization on the last fold
     if results:
         visualize_embeddings(classifier, X_test, y_test, idx_to_label,
-                            config['results_dir'], fold_name="_LOSO_last_fold")
+                            config['results_dir'], fold_name="_LOSO_last_fold",
+                            tsne_dir=config.get('tsne_dir'),
+                            method_name=config.get('method_name', ''))
     
     # Resultats agreges
     if results:
@@ -962,13 +1208,15 @@ def run_logo_cross_validation(X, y, participants, idx_to_label, config, n_folds=
         if len(X_train) == 0 or len(X_val) == 0 or len(X_test) == 0:
             print("WARNING: One split is empty, skipping this fold")
             continue
-        
-        # Generate triplets
-        n_triplets = len(X_train) * 3
-        triplet_indices = generate_triplets_for_subset(y_train, n_triplets)
 
-        if triplet_indices is None:
-            continue
+        # Pre-generate triplets only for random mining
+        if config.get('mining_strategy', 'random') == 'semihard':
+            triplet_indices = None
+        else:
+            n_triplets = len(X_train) * 3
+            triplet_indices = generate_triplets_for_subset(y_train, n_triplets)
+            if triplet_indices is None:
+                continue
 
         # Phase 1: Pre-training
         contrastive_model = pretrain_contrastive(X_train, y_train, triplet_indices,
@@ -996,7 +1244,9 @@ def run_logo_cross_validation(X, y, participants, idx_to_label, config, n_folds=
     # Visualization on the last fold
     if results:
         visualize_embeddings(classifier, X_test, y_test, idx_to_label,
-                            config['results_dir'], fold_name="_LOGO_last_fold")
+                            config['results_dir'], fold_name="_LOGO_last_fold",
+                            tsne_dir=config.get('tsne_dir'),
+                            method_name=config.get('method_name', ''))
     
     # Resultats agreges
     if results:
@@ -1045,8 +1295,27 @@ def main():
     parser.add_argument('--finetune-patience', type=int,
                        default=int(os.environ.get('HAR_FINETUNE_PATIENCE', 15)),
                        help='Early stopping patience for fine-tuning (default: 15)')
+    parser.add_argument('--shift-prob', type=float,
+                       default=float(os.environ.get('HAR_SHIFT_PROB', '0.0')),
+                       help='Probability of applying temporal shifting (0.0 = disabled, default: 0.0)')
+    parser.add_argument('--shift-max-frac', type=float,
+                       default=float(os.environ.get('HAR_SHIFT_MAX_FRAC', '0.1')),
+                       help='Max shift as a fraction of sequence length (default: 0.1 = 10%%)')
+    parser.add_argument('--mining-strategy', type=str,
+                       default=os.environ.get('HAR_MINING_STRATEGY', 'random'),
+                       choices=['random', 'semihard'],
+                       help='Triplet mining strategy: random (offline pre-generation) or '
+                            'semihard (online per-batch, default: random)')
     parser.add_argument('--strategies', type=str, default='all',
                        help='Strategies to run: all, stratified, loso, logo, or comma-separated list')
+    parser.add_argument('--results-dir', type=str, default=None,
+                       help='Explicit results directory (overrides auto-naming from --results-base-dir)')
+    parser.add_argument('--method-name', type=str, default=None,
+                       help='Method label used in CSV filename and t-SNE naming (e.g. random_shift)')
+    parser.add_argument('--tsne-dir', type=str, default=None,
+                       help='Directory for t-SNE images (defaults to results_dir if not set)')
+    parser.add_argument('--checkpoints-dir', type=str, default=None,
+                       help='Explicit checkpoints directory (overrides auto-naming from --checkpoints-base-dir)')
     args = parser.parse_args()
 
     if args.data_fraction <= 0.0 or args.data_fraction > 1.0:
@@ -1074,17 +1343,31 @@ def main():
         # Keep canonical execution order
         strategies_to_run = [s for s in valid_strategies if s in requested]
     
-    # Build directory suffix
+    # Build directory suffix — each combination of options gets its own directory
     if args.data_fraction == 1.0:
         dir_suffix = f'{args.loss_type}'
     else:
         dir_suffix = f'{args.loss_type}_{int(args.data_fraction*100)}pct'
+    # Append mining strategy suffix (only non-default value changes the name)
+    if args.mining_strategy == 'semihard':
+        dir_suffix += '_semihard'
+    # Append shift suffix to avoid overwriting results without shifting
+    if args.shift_prob > 0.0:
+        dir_suffix += '_shift'
     
+    # Resolve explicit-or-auto paths
+    resolved_results_dir = args.results_dir if args.results_dir else os.path.join(args.results_base_dir, f'results_contrastive_{dir_suffix}')
+    resolved_checkpoint_dir = args.checkpoints_dir if args.checkpoints_dir else os.path.join(args.checkpoints_base_dir, f'checkpoints_contrastive_{dir_suffix}')
+    resolved_method_name = args.method_name if args.method_name else dir_suffix
+    resolved_tsne_dir = args.tsne_dir  # None means: fall back to results_dir inside visualize_embeddings
+
     # Configuration
     config = {
         'data_dir': args.data_dir,
-        'results_dir': os.path.join(args.results_base_dir, f'results_contrastive_{dir_suffix}'),
-        'checkpoint_dir': os.path.join(args.checkpoints_base_dir, f'checkpoints_contrastive_{dir_suffix}'),
+        'results_dir': resolved_results_dir,
+        'checkpoint_dir': resolved_checkpoint_dir,
+        'method_name': resolved_method_name,
+        'tsne_dir': resolved_tsne_dir,
         
         # Data
         'data_fraction': args.data_fraction,
@@ -1095,7 +1378,10 @@ def main():
         
         # Contrastive learning
         'projection_dim': 256,
-        'triplet_margin': 1.0,  # Pour Triplet Loss
+        'triplet_margin': 1.0,
+        'mining_strategy': args.mining_strategy,
+        'shift_prob': args.shift_prob,
+        'shift_max_frac': args.shift_max_frac,
         'pretrain_epochs': args.pretrain_epochs,
         'pretrain_patience': args.pretrain_patience,
         'lr': 0.001,
@@ -1117,7 +1403,12 @@ def main():
     print("="*80)
     print(f"Configuration: {args.data_fraction*100:.0f}% of training data")
     print(f"Loss function: {args.loss_type.upper()}")
+    print(f"Mining strategy: {args.mining_strategy.upper()}")
     print(f"Strategies: {', '.join(strategies_to_run)}")
+    if args.shift_prob > 0.0:
+        print(f"Temporal shifting: ENABLED (prob={args.shift_prob}, max_frac={args.shift_max_frac})")
+    else:
+        print("Temporal shifting: DISABLED (use --shift-prob to enable)")
     print(f"Pretrain epochs/patience: {args.pretrain_epochs}/{args.pretrain_patience}")
     print(f"Finetune epochs/patience: {args.finetune_epochs}/{args.finetune_patience}")
     print(f"Data dir: {config['data_dir']}")
@@ -1155,7 +1446,7 @@ def main():
         all_results.extend(results_logo)
     
     df_all_results = pd.DataFrame(all_results)
-    results_path = os.path.join(config['results_dir'], 'all_results_contrastive.csv')
+    results_path = os.path.join(config['results_dir'], f"all_results_{config.get('method_name', 'contrastive')}.csv")
     df_all_results.to_csv(results_path, index=False)
     
     print("\n" + "="*80)

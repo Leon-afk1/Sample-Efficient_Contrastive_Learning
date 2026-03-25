@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=har_baseline
+# NOTE: This script runs all 4 models (DNN, LSTM, Transformer, SDCNet) at 100%
+# for model selection purposes. Results are saved to results/100pct/baseline_model_selection/.
+# For the per-fraction SDCNet-only runs, use run_baseline_allpct_slurm.sh instead.
+#SBATCH --job-name=har_baseline_model_sel
 #SBATCH --time=24:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
 #SBATCH --mem=64G
-#SBATCH --output=logs/baseline_%j.out
-#SBATCH --error=logs/baseline_%j.err
+#SBATCH --account=def-s1gabour
+#SBATCH --output=Log/slurm/baseline_%j.out
+#SBATCH --error=Log/slurm/baseline_%j.err
+#SBATCH --mail-user=leon.morales@utbm.fr
+#SBATCH --mail-type=END,FAIL
 
 set -euo pipefail
 
@@ -44,24 +50,24 @@ fi
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export PYTHONUNBUFFERED=1
 
-DATA_DIR="${HAR_DATA_DIR:-$PACK_ROOT/data/raw}"
-RESULTS_DIR="${HAR_BASELINE_RESULTS_DIR:-$PACK_ROOT/outputs/results_baseline}"
-CHECKPOINTS_DIR="${HAR_BASELINE_CHECKPOINTS_DIR:-$PACK_ROOT/outputs/checkpoints_baseline}"
+DATA_DIR="${HAR_DATA_DIR:-$PACK_ROOT/Data Malwear/brut}"
+RESULTS_DIR="$PACK_ROOT/results/100pct/baseline_model_selection"
+CHECKPOINTS_DIR="$PACK_ROOT/checkpoints/100pct/baseline_model_selection"
+LOG_FILE="$PACK_ROOT/Log/100pct/baseline_model_selection.log"
 
-mkdir -p "$PACK_ROOT/logs" "$PACK_ROOT/outputs" "$RESULTS_DIR" "$CHECKPOINTS_DIR"
+mkdir -p "$RESULTS_DIR/classification_report" "$CHECKPOINTS_DIR" "$(dirname "$LOG_FILE")"
 
-echo "=========================================="
-echo "BASELINE TRAINING (SLURM)"
-echo "=========================================="
-echo "Job ID: ${SLURM_JOB_ID:-N/A}"
-echo "Node: ${SLURMD_NODENAME:-N/A}"
-echo "Data dir: $DATA_DIR"
-echo "Results dir: $RESULTS_DIR"
-echo "Checkpoints dir: $CHECKPOINTS_DIR"
+echo "==========================================" | tee -a "$LOG_FILE"
+echo "BASELINE TRAINING" | tee -a "$LOG_FILE"
+echo "==========================================" | tee -a "$LOG_FILE"
+echo "Job ID: ${SLURM_JOB_ID:-N/A}" | tee -a "$LOG_FILE"
+echo "Node:   ${SLURMD_NODENAME:-N/A}" | tee -a "$LOG_FILE"
+echo "Data dir:    $DATA_DIR" | tee -a "$LOG_FILE"
+echo "Results dir: $RESULTS_DIR" | tee -a "$LOG_FILE"
 
 python "$PACK_ROOT/src/train_baseline.py" \
   --data-dir "$DATA_DIR" \
   --results-dir "$RESULTS_DIR" \
-  --checkpoints-dir "$CHECKPOINTS_DIR"
+  --checkpoints-dir "$CHECKPOINTS_DIR" 2>&1 | tee -a "$LOG_FILE"
 
-echo "Baseline SLURM run completed successfully."
+echo "Baseline training complete." | tee -a "$LOG_FILE"

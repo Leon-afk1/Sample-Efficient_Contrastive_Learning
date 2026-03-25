@@ -9,9 +9,22 @@ venv/
 # Jupyter
 .ipynb_checkpoints/
 
-# Runtime outputs
-logs/
+# Runtime outputs - data and checkpoints (large binary files)
+Data Malwear/
 contrastive_data/
+checkpoints/
+
+# SLURM logs (can be large, regenerated per run)
+Log/**/*.log
+Log/**/*.out
+Log/**/*.err
+
+# Results: keep CSVs and text reports, ignore large image files in results/
+results/**/*.png
+results/**/*.pth
+
+# Legacy output paths (old structure)
+logs/
 outputs/results_*/
 outputs/checkpoints_*/
 outputs/*.csv
